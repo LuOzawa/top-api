@@ -23,6 +23,7 @@ GCE VM (e2-micro)                Cloud Storage              Cloud Run
 | `GET /` | 榜单 HTML 页 |
 | `GET /api/health` | 健康检查 |
 | `GET /api/top` | 榜单 JSON，参数：`slot`(morning/evening)、`limit`(1-30)、`platform` |
+| `GET /api/trend` | **跨平台趋势**：`cross_platform`(同内容多平台上榜)、`rising`(连续多日上升)、`top_domains`；参数 `limit` |
 | `GET /docs` | Swagger 自动文档 |
 
 示例：
@@ -30,7 +31,15 @@ GCE VM (e2-micro)                Cloud Storage              Cloud Run
 ```bash
 curl -s "https://top-api-326624733889.us-central1.run.app/api/top?limit=3"
 curl -s ".../api/top?platform=hn&limit=5"
+curl -s ".../api/trend?limit=10"
 ```
+
+## 数据管道与 BigQuery
+
+- 每天 4 次抓取后，VM 上的 `export_digest.py` 自动执行：
+  1. 生成 `digest/latest.json`（日报 + 趋势）上传 GCS，API 60 秒内自动生效
+  2. 当天明细 NDJSON 上传 GCS，并提交 **BigQuery 增量加载**（按 `day` 分区，`WRITE_TRUNCATE` 只替换当天分区）
+- BigQuery 数据集：`crawler.dg_items`（day / slot / platform / item_id / title / url / points / comments）
 
 ## 本地运行
 

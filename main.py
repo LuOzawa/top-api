@@ -80,16 +80,27 @@ class FavoritePatch(BaseModel):
 _pool = None
 
 
+PG_DSN = os.environ.get("PG_DSN", "")   # 测试/本地开发用完整 DSN，优先级最高
+
+
+def _conninfo():
+    if PG_DSN:
+        return PG_DSN
+    if INSTANCE_CONNECTION_NAME:
+        return (f"host=/cloudsql/{INSTANCE_CONNECTION_NAME} dbname={DB_NAME} "
+                f"user={DB_USER} password={DB_PASSWORD} connect_timeout=5")
+    return ""
+
+
 def get_pool():
     global _pool
-    if not INSTANCE_CONNECTION_NAME:
+    ci = _conninfo()
+    if not ci:
         return None
     if _pool is None:
         from psycopg_pool import ConnectionPool
         _pool = ConnectionPool(
-            conninfo=(f"host=/cloudsql/{INSTANCE_CONNECTION_NAME} dbname={DB_NAME} "
-                      f"user={DB_USER} password={DB_PASSWORD} connect_timeout=5"),
-            min_size=1, max_size=4, timeout=5, open=True,
+            conninfo=ci, min_size=1, max_size=4, timeout=5, open=True,
             kwargs={"autocommit": True},
         )
     return _pool
@@ -98,7 +109,7 @@ def get_pool():
 def db_connect():
     pool = get_pool()
     if pool is None:
-        raise RuntimeError("INSTANCE_CONNECTION_NAME 未设置")
+        raise RuntimeError("未配置数据库连接（INSTANCE_CONNECTION_NAME 或 PG_DSN）")
     return pool.connection()
 
 

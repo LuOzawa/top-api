@@ -86,6 +86,28 @@ def top(
     }
 
 
+@app.get("/api/trend")
+def trend(limit: int = Query(10, ge=1, le=50)):
+    """跨平台趋势：同一内容出现在多个平台、连续多日上升、上榜域名分布。"""
+    try:
+        data = load_data()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"data unavailable: {type(e).__name__}")
+
+    tr = data.get("trend") or {}
+    if not tr:
+        return {"day": data.get("day"), "note": "暂无趋势数据（等待下一次抓取导出）"}
+    return {
+        "day": data.get("day"),
+        "window_days": tr.get("window_days"),
+        "generated_at": tr.get("generated_at"),
+        "total_items": tr.get("total_items"),
+        "cross_platform": tr.get("cross_platform", [])[:limit],
+        "rising": tr.get("rising", [])[:limit],
+        "top_domains": tr.get("top_domains", [])[:limit],
+    }
+
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     try:
@@ -126,6 +148,7 @@ def index():
 <p class=muted>数据日：{esc(str(data.get('day', '?')))} · 生成于 {esc(str(data.get('generated_at', '?')))}</p>
 {''.join(rows)}
 <footer>API：<a href="/api/top">/api/top</a> ·
+ <a href="/api/trend">/api/trend</a> ·
  <a href="/api/top?slot=morning&limit=5">?limit=5</a> ·
  <a href="/api/top?platform=hn">?platform=hn</a> ·
  <a href="/docs">Swagger</a></footer>

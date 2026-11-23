@@ -1,6 +1,6 @@
 # top-api
 
-技术日报数据 API —— 跑在 **Cloud Run** 上的 FastAPI 服务，数据来自 GCS 上的公开 JSON。
+技术日报数据 API —— 跑在 **Cloud Run** 上的 FastAPI 服务，数据来自 GCS 上的 JSON（**服务账号认证读取**，桶的匿名访问已被组织策略拦截）。
 
 线上地址：<https://top-api-326624733889.us-central1.run.app>
 
@@ -9,12 +9,29 @@
 ```
 GCE VM (e2-micro)                Cloud Storage              Cloud Run
 ┌─────────────────┐        ┌────────────────────┐      ┌──────────────────┐
-│ crawler 抓 8 个  │ 每天4次│ digest/latest.json │ 读取 │ top-api (FastAPI)│
-│ 平台到 SQLite    │ ─────► │ 公开只读 (36 KB)    │ ───► │ 512Mi / 缩容到 0  │
+│ crawler 抓 8 个  │ 每天4次│ digest/latest.json │ 认证 │ top-api (FastAPI)│
+│ 平台到 SQLite    │ ─────► │ 认证读 (43 KB)      │ ───► │ 512Mi / 缩容到 0  │
 └─────────────────┘ 导出    └────────────────────┘      └──────────────────┘
                                                               ▲
                                         git push → Cloud Build ┘
 ```
+
+## 数据读取方式（2026-11-23 变更）
+
+桶开启了 **uniform bucket-level access**（且已锁定），匿名读取被祖先层的「公开访问预防」拦截——
+即使 IAM 里还挂着 `allUsers: objectViewer`，公网直接访问也是 **403**。
+
+所以 `load_data()` 改成**认证优先**：
+
+1. 从 metadata server 取服务账号令牌（`Metadata-Flavor: Google`），内存缓存到过期前 60 秒
+2. `GET https://storage.googleapis.com/storage/v1/b/<bucket>/o/digest%2Flatest.json?alt=media` + Bearer token
+3. 认证失败才回退公开 URL（保留兜底，但默认不依赖）
+
+服务账号 `326624733889-compute@developer.gserviceaccount.com` 对桶有 `roles/storage.objectAdmin`，无需额外授权。
+本地调试可用环境变量 `GOOGLE_OAUTH_TOKEN` 覆盖令牌。
+
+> 历史坑：2026-11-23 15:00 首页和 `/api/trend` 报 `HTTPStatusError`，就是因为公开读失效；
+> 排查过程和对照实验见踩坑日志第 35 条。
 
 ## 端点
 

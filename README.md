@@ -101,18 +101,41 @@ Cloud Run  ──/cloudsql/<PROJECT>:us-central1:digest-pg──►  Cloud SQL
 - 密码：**Secret Manager**（`db-password`）→ 运行时注入 `DB_PASSWORD`，不落代码/镜像
 - 需要的 IAM：Cloud Run 服务账号需 `roles/cloudsql.client` + `roles/secretmanager.secretAccessor`
 
-**连接池**：`psycopg_pool.ConnectionPool`（min 1 / max 4），实例内复用连接。
+**连接池**：`psycopg_pool.ConnectionPool`（min 1 / max `POOL_MAX`=8），实例内复用连接。
 
-**性能基线（实测）**：
+**连接层性能（实测）**：
 
 | 场景 | 耗时 |
 |---|---|
 | 冷启动首次连接 | 375 ms |
-| ~~每请求新建连接~~（优化前）| 27–29 ms |
-| **连接池（现在）** | **3.3–4.6 ms** |
-| 每请求新建连接 | 27–29 ms |
+| 每请求新建连接（优化前）| 27–29 ms |
+| **连接池（现在）** | **3.3–4.8 ms** |
 
-> 每次请求新建连接，在并发下会打满 `max_connections` → 下一步用连接池（psycopg_pool）把耗时压到个位数 ms。
+## 监控与告警
+
+Cloud Monitoring 告警策略（通知到邮件）：
+
+| 策略 | 条件 |
+|---|---|
+| top-api · 5xx 错误率 | `run.googleapis.com/request_count` 5xx 类 > 0.05/s，持续 5 分钟 |
+| top-api · P95 延迟 | `request_latencies` P95 > 2s，持续 5 分钟 |
+| Cloud SQL · 连接数 | `num_backends` > 20（db-f1-micro 上限约 25）|
+| luozawa-site · 拨测 | 站点不可用，持续 1 分钟 |
+
+## 压测结果
+
+从**同区域 GCE 实例**发起（排除跨境网络干扰），500 请求 / 并发 50：
+
+| 路径 | RPS | p50 | p95 | 状态码 |
+|---|---|---|---|---|
+| `/api/top`（Postgres，**优化前**）| 228 | 215 ms | 266 ms | 100% 200 |
+| `/api/top`（Postgres，**优化后**）| **375** | **112 ms** | **162 ms** | 100% 200 |
+| `/api/top?source=gcs`（内存缓存）| 356 | 124 ms | 166 ms | 100% 200 |
+| `/api/db`（纯查询）| 554 | 52 ms | 120 ms | 100% 200 |
+
+并发 100（1000 请求）：**341 RPS**，p50 199 ms，p95 281 ms，**100% 200**；p99 出现 1.2s 长尾，来自 Cloud Run 冷启动扩容。
+
+**优化动作**：压测发现连接池 `max_size=4` 成为瓶颈（50 并发排队等连接），改为 8 + 给 DB 路径加 30 秒结果缓存 → **RPS +64%，p50 降低 48%**。
 
 ## 本地运行
 

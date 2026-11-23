@@ -21,6 +21,7 @@ top-api —— 技术日报数据 API（Cloud Run）
   DELETE /api/favorites/{id}   删除
   GET    /api/favorites/stats  按平台统计
 """
+import logging
 import os
 import time
 
@@ -30,9 +31,38 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field, field_validator
 
+log = logging.getLogger("top-api")
+
 BUCKET = os.environ.get("DATA_BUCKET", "luozawa-top-data")
-DATA_URL = f"https://storage.googleapis.com/{BUCKET}/digest/latest.json"
+OBJECT = "digest/latest.json"
+# 公开地址（仅作回退；桶已开启 uniform access + 公开访问被组织策略拦截时不可用）
+DATA_URL = f"https://storage.googleapis.com/{BUCKET}/{OBJECT}"
+# 认证读取：用 Cloud Run 自身服务账号的令牌，不依赖桶的公开访问
+GCS_MEDIA_URL = (
+    f"https://storage.googleapis.com/storage/v1/b/{BUCKET}"
+    f"/o/{OBJECT.replace('/', '%2F')}?alt=media"
+)
+METADATA_TOKEN_URL = (
+    "http://metadata.google.internal/computeMetadata/v1"
+    "/instance/service-accounts/default/token"
+)
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "60"))
+_token = {"value": None, "exp": 0.0}
+
+
+def gcs_token():
+    """取 Cloud Run 服务账号令牌；本地可用 GOOGLE_OAUTH_TOKEN 覆盖便于调试"""
+    override = os.environ.get("GOOGLE_OAUTH_TOKEN")
+    if override:
+        return override
+    now = time.time()
+    if _token["value"] and now < _token["exp"] - 60:
+        return _token["value"]
+    r = httpx.get(METADATA_TOKEN_URL, headers={"Metadata-Flavor": "Google"}, timeout=3)
+    r.raise_for_status()
+    j = r.json()
+    _token.update(value=j["access_token"], exp=now + float(j.get("expires_in", 3600)))
+    return _token["value"]
 
 # ---- Cloud SQL（通过 /cloudsql/<connectionName> 的 Unix socket 连接，
 #      不走公网、不需要配置 IP 白名单）----
@@ -125,12 +155,29 @@ _cache = {"at": 0.0, "data": None}
 
 
 def load_data():
+    """读取 GCS 上的最新日报。
+
+    优先用服务账号令牌走认证读取（2026-11-23 起桶的匿名访问被拒，公开 URL 会 403），
+    失败再回退公开 URL——这样无论桶是否公开都能工作。
+    """
     now = time.time()
     if _cache["data"] is not None and now - _cache["at"] < CACHE_TTL:
         return _cache["data"]
-    r = httpx.get(DATA_URL, timeout=10)
-    r.raise_for_status()
-    data = r.json()
+
+    data = None
+    try:
+        tok = gcs_token()
+        r = httpx.get(GCS_MEDIA_URL, headers={"Authorization": f"Bearer {tok}"}, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:                      # 认证读取失败 → 回退公开地址
+        log.warning("GCS authenticated read failed (%s), falling back to public URL", e)
+
+    if data is None:
+        r = httpx.get(DATA_URL, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+
     _cache.update(at=now, data=data)
     return data
 

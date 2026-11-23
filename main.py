@@ -42,6 +42,8 @@ DB_NAME = os.environ.get("DB_NAME", "digest")
 DB_PASSWORD = os.environ.get("DB_PASSWORD", "")  # 由 Secret Manager 注入
 API_KEY = os.environ.get("API_KEY", "")          # 写操作鉴权（Secret Manager 注入）
 OWNER = os.environ.get("OWNER", "me")
+POOL_MAX = int(os.environ.get("POOL_MAX", "8"))       # db-f1-micro max_connections≈25，2 实例 × 8 仍安全
+TOP_CACHE_TTL = int(os.environ.get("TOP_CACHE_TTL", "30"))
 
 
 # ---------------- 鉴权 ----------------
@@ -100,7 +102,7 @@ def get_pool():
     if _pool is None:
         from psycopg_pool import ConnectionPool
         _pool = ConnectionPool(
-            conninfo=ci, min_size=1, max_size=4, timeout=5, open=True,
+            conninfo=ci, min_size=1, max_size=POOL_MAX, timeout=5, open=True,
             kwargs={"autocommit": True},
         )
     return _pool
@@ -140,8 +142,22 @@ PLATFORM_NAMES = {
 }
 
 
+_top_cache: dict = {}
+
+
 def top_from_db(slot: str, limit: int, platform: str | None):
-    """从 Postgres 读榜单（源数据由 VM 每日同步）"""
+    """从 Postgres 读榜单（源数据每天只更新 4 次，加 30 秒缓存）"""
+    ck = (slot, limit, platform)
+    hit = _top_cache.get(ck)
+    if hit and time.time() - hit[0] < TOP_CACHE_TTL:
+        return hit[1]
+    result = _top_from_db_uncached(slot, limit, platform)
+    if result:
+        _top_cache[ck] = (time.time(), result)
+    return result
+
+
+def _top_from_db_uncached(slot: str, limit: int, platform: str | None):
     sql = ("SELECT platform, title, url, points, comments FROM digest_items"
            " WHERE day = (SELECT MAX(day) FROM digest_items) AND slot = %s")
     params = [slot]

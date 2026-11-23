@@ -1,0 +1,56 @@
+name: build-and-deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write        # Workload Identity Federation 需要
+
+env:
+  PROJECT_ID: project-ec1a0092-7fc0-4dbc-8fd
+  REGION: us-central1
+  AR_REPO: apps
+  SERVICE: top-api
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Auth to Google Cloud (keyless / WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/326624733889/locations/global/workloadIdentityPools/github/providers/github-oidc
+          service_account: gh-deployer@project-ec1a0092-7fc0-4dbc-8fd.iam.gserviceaccount.com
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Build and push image
+        run: |
+          IMAGE="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.AR_REPO }}/${{ env.SERVICE }}:${{ github.sha }}"
+          gcloud auth configure-docker "${{ env.REGION }}-docker.pkg.dev" --quiet
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+
+      - name: Deploy to Cloud Run
+        run: |
+          IMAGE="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.AR_REPO }}/${{ env.SERVICE }}:${{ github.sha }}"
+          gcloud run deploy "${{ env.SERVICE }}" \
+            --image="$IMAGE" \
+            --region="${{ env.REGION }}" \
+            --platform=managed \
+            --allow-unauthenticated \
+            --port=8080 \
+            --memory=512Mi \
+            --cpu=1 \
+            --min-instances=0 \
+            --max-instances=2 \
+            --set-env-vars=DATA_BUCKET=luozawa-top-data \
+            --quiet
+
+      - name: Show service URL
+        run: gcloud run services describe "${{ env.SERVICE }}" --region="${{ env.REGION }}" --format="value(status.url)"

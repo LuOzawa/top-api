@@ -2,12 +2,17 @@
 import glob
 import os
 import pathlib
+import sys
 
 import psycopg
 import pytest
 
 DSN = os.environ.get("PG_DSN", "")
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+# 让 pytest 能 import 到仓库根目录的 main.py
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 
 @pytest.fixture(scope="session", autouse=True)

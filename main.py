@@ -34,14 +34,31 @@ DB_NAME = os.environ.get("DB_NAME", "digest")
 DB_PASSWORD = os.environ.get("DB_PASSWORD", "")  # 由 Secret Manager 注入
 
 
-def db_connect():
+# 连接池：Cloud Run 一个实例内复用连接，避免每请求新建
+# （每请求新建 ≈ 27ms，且在并发下会打满 db-f1-micro 的 max_connections）
+_pool = None
+
+
+def get_pool():
+    global _pool
     if not INSTANCE_CONNECTION_NAME:
+        return None
+    if _pool is None:
+        from psycopg_pool import ConnectionPool
+        _pool = ConnectionPool(
+            conninfo=(f"host=/cloudsql/{INSTANCE_CONNECTION_NAME} dbname={DB_NAME} "
+                      f"user={DB_USER} password={DB_PASSWORD} connect_timeout=5"),
+            min_size=1, max_size=4, timeout=5, open=True,
+            kwargs={"autocommit": True},
+        )
+    return _pool
+
+
+def db_connect():
+    pool = get_pool()
+    if pool is None:
         raise RuntimeError("INSTANCE_CONNECTION_NAME 未设置")
-    return psycopg.connect(
-        host=f"/cloudsql/{INSTANCE_CONNECTION_NAME}",
-        dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD,
-        connect_timeout=5, autocommit=True,
-    )
+    return pool.connection()
 
 
 def db_check():
@@ -64,6 +81,47 @@ def load_data():
     return data
 
 
+PLATFORM_NAMES = {
+    "hn": "Hacker News", "lobsters": "Lobsters", "github": "GitHub 热门项目",
+    "huggingface": "HuggingFace", "devto": "Dev.to", "arxiv": "arXiv (AI)",
+    "stackoverflow": "Stack Overflow", "v2ex": "V2EX",
+}
+
+
+def top_from_db(slot: str, limit: int, platform: str | None):
+    """从 Postgres 读榜单（源数据由 VM 每日同步）"""
+    sql = ("SELECT platform, title, url, points, comments FROM digest_items"
+           " WHERE day = (SELECT MAX(day) FROM digest_items) AND slot = %s")
+    params = [slot]
+    if platform:
+        sql += " AND platform = %s"
+        params.append(platform)
+    sql += " ORDER BY platform, points DESC"
+
+    with db_connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT MAX(day)::text FROM digest_items")
+        row = cur.fetchone()
+        day = row[0] if row else None
+        if not day:
+            return None
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+
+    grouped: dict[str, list] = {}
+    for plat, title, url, pts, cmts in rows:
+        grouped.setdefault(plat, []).append({
+            "title": title, "url": url,
+            "points": pts or 0, "comments": cmts or 0,
+        })
+
+    platforms = {
+        k: {"name": PLATFORM_NAMES.get(k, k), "count": len(v),
+            "items": [dict(it, rank=i) for i, it in enumerate(v[:limit], 1)]}
+        for k, v in grouped.items()
+    }
+    return {"day": day, "slot": slot, "platforms": platforms, "source": "postgres"}
+
+
 def esc(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -83,7 +141,17 @@ def top(
     slot: str = Query("morning", pattern="^(morning|evening)$"),
     limit: int = Query(3, ge=1, le=30),
     platform: str | None = None,
+    source: str = Query("auto", pattern="^(auto|db|gcs)$"),
 ):
+    """榜单数据。source=auto 时优先查 Postgres，失败自动回退到 GCS 快照。"""
+    if source in ("auto", "db"):
+        try:
+            db_result = top_from_db(slot, limit, platform)
+            if db_result and db_result.get("platforms"):
+                return db_result
+        except Exception as e:
+            if source == "db":
+                raise HTTPException(status_code=503, detail=f"db unavailable: {type(e).__name__}: {str(e)[:100]}")
     try:
         data = load_data()
     except Exception as e:
@@ -108,6 +176,7 @@ def top(
         "slot": slot,
         "sent_at": node.get("sent_at"),
         "generated_at": data.get("generated_at"),
+        "source": "gcs",
         "platforms": out,
     }
 
@@ -128,7 +197,17 @@ def db_health():
         "server_version": ver.split(" on ")[0],
         "latency_ms": round((time.time() - started) * 1000, 1),
         "conn": f"/cloudsql/{INSTANCE_CONNECTION_NAME}",
+        "pool": _pool_stats(),
     }
+
+
+def _pool_stats():
+    pool = get_pool()
+    if pool is None:
+        return None
+    st = pool.get_stats()
+    return {"size": st.get("pool_size"), "available": st.get("pool_available"),
+            "requests_queued": st.get("requests_queued")}
 
 
 @app.get("/api/trend")

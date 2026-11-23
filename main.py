@@ -44,7 +44,12 @@ def esc(s: str) -> str:
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "service": "top-api", "data_url": DATA_URL}
+    return {
+        "ok": True,
+        "service": "top-api",
+        "revision": os.environ.get("K_REVISION", "local"),  # Cloud Run 注入，用于确认版本
+        "data_url": DATA_URL,
+    }
 
 
 @app.get("/api/top")

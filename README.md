@@ -27,13 +27,49 @@ GCE VM (e2-micro)                Cloud Storage              Cloud Run
 | `GET /api/db` | **数据库连通性**：PG 版本 / 库名 / 用户 / 服务端时间 / 连接耗时 |
 | `GET /docs` | Swagger 自动文档 |
 
+### 收藏（写路径，需 `X-API-Key`）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `POST` | `/api/favorites` | 新增收藏。**幂等**：同一 URL 重复提交返回 200 + 原记录（不产生重复行）；新建返回 201 |
+| `GET` | `/api/favorites` | 列表，参数 `limit`(1-100) / `offset` / `platform` |
+| `PATCH` | `/api/favorites/{id}` | 改 `title` / `note` |
+| `DELETE` | `/api/favorites/{id}` | 删除（204）|
+| `GET` | `/api/favorites/stats` | 按平台统计 |
+
+**鉴权**：写操作需要请求头 `X-API-Key`，Key 存在 **Secret Manager**（`api-key`），运行时注入，不进代码/镜像。读接口（top/trend/health）公开。
+
+**错误码约定**：`400` 空更新 · `401` Key 无效/缺失 · `404` id 不存在 · `422` 参数校验失败 · `503` 依赖不可用
+
 示例：
 
 ```bash
-curl -s "https://top-api-326624733889.us-central1.run.app/api/top?limit=3"
-curl -s ".../api/top?platform=hn&limit=5"
-curl -s ".../api/trend?limit=10"
+BASE="https://top-api-326624733889.us-central1.run.app"
+curl -s "$BASE/api/top?limit=3"
+curl -s "$BASE/api/trend?limit=10"
+
+# 写操作（K 为你的 API Key）
+K="<api-key>"
+curl -s -X POST "$BASE/api/favorites" -H "X-API-Key: $K" -H 'Content-Type: application/json' \
+     -d '{"url":"https://example.com/post","title":"示例","platform":"hn"}'
+curl -s "$BASE/api/favorites?limit=10" -H "X-API-Key: $K"
+curl -s -X PATCH "$BASE/api/favorites/1" -H "X-API-Key: $K" -H 'Content-Type: application/json' -d '{"note":"稍后读"}'
+curl -s -X DELETE "$BASE/api/favorites/1" -H "X-API-Key: $K"
 ```
+
+## 数据库迁移与测试
+
+```bash
+# 迁移（版本化 SQL，记录在 schema_migrations 表，可重复执行）
+python run_migrations.py --status    # 看状态
+python run_migrations.py             # 应用未执行的迁移
+
+# 测试（需要 Postgres；CI 里用临时容器跑真实 CRUD）
+PG_DSN=postgresql://postgres:postgres@localhost:5432/postgres \
+API_KEY=test-key OWNER=me pytest -q
+```
+
+CI 流程：**test → deploy**（测试不过，部署直接跳过）。
 
 ## 数据管道与 BigQuery
 

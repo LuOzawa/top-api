@@ -11,17 +11,43 @@ top-api —— 技术日报数据 API（Cloud Run）
       ?slot=morning|evening   默认 morning
       ?limit=1..30            每平台条数，默认 3
       ?platform=hn            只看某个平台
+  GET /api/trend        跨平台趋势（同内容多平台上榜 / 连续上升 / 域名分布）
+  GET /api/db           数据库连通性（Cloud SQL Postgres，走 Unix socket）
 """
 import os
 import time
 
 import httpx
+import psycopg
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
 
 BUCKET = os.environ.get("DATA_BUCKET", "luozawa-top-data")
 DATA_URL = f"https://storage.googleapis.com/{BUCKET}/digest/latest.json"
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "60"))
+
+# ---- Cloud SQL（通过 /cloudsql/<connectionName> 的 Unix socket 连接，
+#      不走公网、不需要配置 IP 白名单）----
+INSTANCE_CONNECTION_NAME = os.environ.get("INSTANCE_CONNECTION_NAME", "")
+DB_USER = os.environ.get("DB_USER", "app")
+DB_NAME = os.environ.get("DB_NAME", "digest")
+DB_PASSWORD = os.environ.get("DB_PASSWORD", "")  # 由 Secret Manager 注入
+
+
+def db_connect():
+    if not INSTANCE_CONNECTION_NAME:
+        raise RuntimeError("INSTANCE_CONNECTION_NAME 未设置")
+    return psycopg.connect(
+        host=f"/cloudsql/{INSTANCE_CONNECTION_NAME}",
+        dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD,
+        connect_timeout=5, autocommit=True,
+    )
+
+
+def db_check():
+    with db_connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT version(), current_database(), current_user, now()")
+        return cur.fetchone()
 
 app = FastAPI(title="luozawa top-api", version="1.0.0")
 _cache = {"at": 0.0, "data": None}
@@ -83,6 +109,25 @@ def top(
         "sent_at": node.get("sent_at"),
         "generated_at": data.get("generated_at"),
         "platforms": out,
+    }
+
+
+@app.get("/api/db")
+def db_health():
+    """验证 Cloud Run → Cloud SQL(Postgres) 的连通性"""
+    started = time.time()
+    try:
+        ver, dbname, user, now = db_check()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"db unavailable: {type(e).__name__}: {str(e)[:120]}")
+    return {
+        "ok": True,
+        "database": dbname,
+        "user": user,
+        "server_time": str(now),
+        "server_version": ver.split(" on ")[0],
+        "latency_ms": round((time.time() - started) * 1000, 1),
+        "conn": f"/cloudsql/{INSTANCE_CONNECTION_NAME}",
     }
 
 

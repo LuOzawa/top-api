@@ -13,14 +13,22 @@ top-api —— 技术日报数据 API（Cloud Run）
       ?platform=hn            只看某个平台
   GET /api/trend        跨平台趋势（同内容多平台上榜 / 连续上升 / 域名分布）
   GET /api/db           数据库连通性（Cloud SQL Postgres，走 Unix socket）
+
+  —— 收藏（W3 写路径，写操作需 X-API-Key）——
+  POST   /api/favorites        新增收藏（幂等：同一 URL 只存一条）
+  GET    /api/favorites        列表（分页 + 平台过滤）
+  PATCH  /api/favorites/{id}   修改标题/备注
+  DELETE /api/favorites/{id}   删除
+  GET    /api/favorites/stats  按平台统计
 """
 import os
 import time
 
 import httpx
 import psycopg
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field, field_validator
 
 BUCKET = os.environ.get("DATA_BUCKET", "luozawa-top-data")
 DATA_URL = f"https://storage.googleapis.com/{BUCKET}/digest/latest.json"
@@ -32,6 +40,39 @@ INSTANCE_CONNECTION_NAME = os.environ.get("INSTANCE_CONNECTION_NAME", "")
 DB_USER = os.environ.get("DB_USER", "app")
 DB_NAME = os.environ.get("DB_NAME", "digest")
 DB_PASSWORD = os.environ.get("DB_PASSWORD", "")  # 由 Secret Manager 注入
+API_KEY = os.environ.get("API_KEY", "")          # 写操作鉴权（Secret Manager 注入）
+OWNER = os.environ.get("OWNER", "me")
+
+
+# ---------------- 鉴权 ----------------
+def require_key(x_api_key: str | None = Header(default=None, alias="X-API-Key")):
+    """写操作需要 API Key；Key 只在 Secret Manager 里，不进代码"""
+    if not API_KEY:
+        raise HTTPException(status_code=503, detail="服务端未配置 API_KEY")
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="X-API-Key 无效或缺失")
+    return True
+
+
+# ---------------- 输入模型 ----------------
+class FavoriteIn(BaseModel):
+    url: str = Field(..., min_length=8, max_length=2000)
+    title: str | None = Field(None, max_length=300)
+    platform: str | None = Field(None, max_length=40)
+    note: str | None = Field(None, max_length=1000)
+
+    @field_validator("url")
+    @classmethod
+    def _check_url(cls, v: str) -> str:
+        v = v.strip()
+        if not v.startswith(("http://", "https://")):
+            raise ValueError("url 必须以 http:// 或 https:// 开头")
+        return v
+
+
+class FavoritePatch(BaseModel):
+    title: str | None = Field(None, max_length=300)
+    note: str | None = Field(None, max_length=1000)
 
 
 # 连接池：Cloud Run 一个实例内复用连接，避免每请求新建
@@ -230,6 +271,111 @@ def trend(limit: int = Query(10, ge=1, le=50)):
         "rising": tr.get("rising", [])[:limit],
         "top_domains": tr.get("top_domains", [])[:limit],
     }
+
+
+# ---------------- 收藏（写路径）----------------
+FAV_COLS = "id, url, title, platform, note, created_at, updated_at"
+
+
+def _fav(row):
+    return {
+        "id": row[0], "url": row[1], "title": row[2], "platform": row[3], "note": row[4],
+        "created_at": row[5].isoformat() if row[5] else None,
+        "updated_at": row[6].isoformat() if row[6] else None,
+    }
+
+
+@app.get("/api/favorites/stats")
+def favorites_stats(_=Depends(require_key)):
+    """按平台统计收藏（必须声明在 /{fav_id} 之前，否则 stats 会被当成 id）"""
+    with db_connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*), MIN(created_at), MAX(created_at)"
+                    " FROM favorites WHERE owner = %s", (OWNER,))
+        total, first, last = cur.fetchone()
+        cur.execute("SELECT COALESCE(platform, '(unknown)'), COUNT(*) FROM favorites"
+                    " WHERE owner = %s GROUP BY 1 ORDER BY 2 DESC", (OWNER,))
+        by_platform = [{"platform": p, "count": n} for p, n in cur.fetchall()]
+    return {
+        "total": total,
+        "first_added": first.isoformat() if first else None,
+        "last_added": last.isoformat() if last else None,
+        "by_platform": by_platform,
+    }
+
+
+@app.post("/api/favorites", status_code=201)
+def add_favorite(item: FavoriteIn, response: Response, _=Depends(require_key)):
+    """新增收藏。同一 URL 重复提交是幂等的：返回已有记录（200），不会产生重复行。"""
+    sql = f"""
+        INSERT INTO favorites (owner, url, title, platform, note)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (owner, url) DO UPDATE SET
+          title    = COALESCE(EXCLUDED.title, favorites.title),
+          platform = COALESCE(EXCLUDED.platform, favorites.platform),
+          note     = COALESCE(EXCLUDED.note, favorites.note),
+          updated_at = now()
+        RETURNING {FAV_COLS}, (xmax = 0) AS inserted
+    """
+    with db_connect() as conn, conn.cursor() as cur:
+        cur.execute(sql, (OWNER, item.url, item.title, item.platform, item.note))
+        row = cur.fetchone()
+    created = bool(row[7])
+    response.status_code = 201 if created else 200
+    return {"created": created, **_fav(row)}
+
+
+@app.get("/api/favorites")
+def list_favorites(
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    platform: str | None = Query(None, max_length=40),
+    _=Depends(require_key),
+):
+    where = "WHERE owner = %s"
+    params = [OWNER]
+    if platform:
+        where += " AND platform = %s"
+        params.append(platform)
+    with db_connect() as conn, conn.cursor() as cur:
+        cur.execute(f"SELECT COUNT(*) FROM favorites {where}", params)
+        total = cur.fetchone()[0]
+        cur.execute(
+            f"SELECT {FAV_COLS} FROM favorites {where}"
+            " ORDER BY created_at DESC, id DESC LIMIT %s OFFSET %s",
+            params + [limit, offset])
+        rows = cur.fetchall()
+    return {"total": total, "limit": limit, "offset": offset,
+            "items": [_fav(r) for r in rows]}
+
+
+@app.patch("/api/favorites/{fav_id}")
+def patch_favorite(fav_id: int, body: FavoritePatch, _=Depends(require_key)):
+    sets, params = [], []
+    if body.title is not None:
+        sets.append("title = %s")
+        params.append(body.title)
+    if body.note is not None:
+        sets.append("note = %s")
+        params.append(body.note)
+    if not sets:
+        raise HTTPException(status_code=400, detail="没有需要更新的字段（title/note 至少给一个）")
+    params += [fav_id, OWNER]
+    with db_connect() as conn, conn.cursor() as cur:
+        cur.execute(f"UPDATE favorites SET {', '.join(sets)}, updated_at = now()"
+                    f" WHERE id = %s AND owner = %s RETURNING {FAV_COLS}", params)
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"收藏 {fav_id} 不存在")
+    return _fav(row)
+
+
+@app.delete("/api/favorites/{fav_id}", status_code=204)
+def delete_favorite(fav_id: int, _=Depends(require_key)):
+    with db_connect() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM favorites WHERE id = %s AND owner = %s", (fav_id, OWNER))
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail=f"收藏 {fav_id} 不存在")
+    return Response(status_code=204)
 
 
 @app.get("/", response_class=HTMLResponse)

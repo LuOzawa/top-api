@@ -50,8 +50,8 @@ jobs:
             --min-instances=0 \
             --max-instances=2 \
             --add-cloudsql-instances="${{ env.PROJECT_ID }}:${{ env.REGION }}:digest-pg" \
-            --set-env-vars="DATA_BUCKET=luozawa-top-data,INSTANCE_CONNECTION_NAME=${{ env.PROJECT_ID }}:${{ env.REGION }}:digest-pg,DB_USER=app,DB_NAME=digest" \
-            --set-secrets="DB_PASSWORD=db-password:latest" \
+            --set-env-vars="DATA_BUCKET=luozawa-top-data,INSTANCE_CONNECTION_NAME=${{ env.PROJECT_ID }}:${{ env.REGION }}:digest-pg,DB_USER=app,DB_NAME=digest,OWNER=me" \
+            --set-secrets="DB_PASSWORD=db-password:latest,API_KEY=api-key:latest" \
             --quiet
 
       - name: Show service URL
